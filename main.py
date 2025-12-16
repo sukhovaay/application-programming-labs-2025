@@ -1,56 +1,59 @@
 import argparse
 import csv
+import requests
 import os
+import time
 import random
 import re
-import time
-from pathlib import Path
 
-import requests
 from bs4 import BeautifulSoup
 
 
-def handle_cli_args():
-    """Обрабатывает и валидирует аргументы командной строки."""
+def parse_arguments():
+    """Парсинг аргументов командной строки"""
     parser = argparse.ArgumentParser(
-        description="Загрузчик аудиофайлов длительностью более 10 секунд с Mixkit"
+        description="Скачивание звуков с mixkit.co (только >10 секунд)"
     )
+
     parser.add_argument(
-        "--target-dir",
-        "-t",
+        "--download-folder",
+        "-d",
         required=True,
-        help="Целевая директория для сохранения аудиофайлов",
+        help="Папка для сохранения аудиофайлов",
     )
     parser.add_argument(
-        "--min-count", type=int, default=50, help="Минимальное требуемое количество файлов"
+        "--min-files", type=int, default=50, help="Минимальное количество файлов"
     )
     parser.add_argument(
-        "--max-count", type=int, default=100, help="Максимальное количество файлов для загрузки"
+        "--max-files", type=int, default=100, help="Максимальное количество файлов"
     )
+
     args = parser.parse_args()
 
-    if not (50 <= args.max_count <= 1000):
-        parser.error("Аргумент --max-count должен быть в диапазоне от 50 до 1000")
-    if args.min_count > args.max_count:
-        parser.error("Аргумент --min-count не может превышать --max-count")
+    # Валидация аргументов
+    if not (50 <= args.max_files <= 1000):
+        parser.error("--max-files должно быть от 50 до 1000")
+    if args.min_files > args.max_files:
+        parser.error("--min-files не может быть больше --max-files")
 
     return args
 
 
-class AudioHarvester:
-    """Основной класс для поиска и загрузки аудио."""
-
+class SoundDownloader:
     def __init__(self):
-        self.http_client = requests.Session()
-        self.http_client.headers.update({
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-        })
-        self.site_root = "https://mixkit.co"
+        self.session = requests.Session()
+        self.session.headers.update(
+            {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36"
+            }
+        )
+        self.base_url = "https://mixkit.co"
 
-    def discover_audio_pages(self):
-        """Собирает URL страниц с аудиозаписями из различных категорий."""
-        discovered_urls = []
-        category_list = [
+    def get_sound_pages(self):
+        """Получить страницы со звуками из разных разделов"""
+        sound_pages = []
+
+        sections = [
             "/free-sound-effects/",
             "/free-sound-effects/animals/",
             "/free-sound-effects/cartoon/",
@@ -63,229 +66,271 @@ class AudioHarvester:
             "/free-sound-effects/transportation/",
         ]
 
-        for category_path in category_list:
-            if len(discovered_urls) >= 100:
+        for section in sections:
+            if len(sound_pages) >= 100:
                 break
-            full_url = self.site_root + category_path
-            print(f"Сканирую категорию: {category_path}")
+
+            url = self.base_url + section
+            print(f"Поиск в разделе: {section}")
 
             try:
-                page_response = self.http_client.get(full_url)
-                page_soup = BeautifulSoup(page_response.text, "html.parser")
-                all_page_links = page_soup.find_all("a", href=True)
+                response = self.session.get(url)
+                soup = BeautifulSoup(response.text, "html.parser")
 
-                for link_tag in all_page_links:
-                    href_value = link_tag["href"]
-                    # Ищем ссылки на отдельные страницы звуков
-                    if href_value.startswith("/free-sound-effects/") and href_value.count("/") == 3:
-                        complete_url = self.site_root + href_value
-                        if complete_url not in discovered_urls:
-                            discovered_urls.append(complete_url)
+                # Ищем ссылки на отдельные звуки
+                all_links = soup.find_all("a", href=True)
+
+                for link in all_links:
+                    href = link["href"]
+                    # Ищем ссылки вида /free-sound-effects/название-звука-123/
+                    if href.startswith("/free-sound-effects/") and href.count("/") == 3:
+                        full_url = self.base_url + href
+                        if full_url not in sound_pages:
+                            sound_pages.append(full_url)
+
                 time.sleep(1)
-            except Exception as err:
-                print(f"Ошибка при обработке категории {category_path}: {err}")
-                continue
 
-        return discovered_urls
+            except Exception as e:
+                raise Exception(f"Ошибка при парсинге раздела {section}: {e}")
 
-    def extract_duration_seconds(self, duration_text):
-        """Конвертирует строковое представление длительности в секунды (int)."""
-        if not duration_text:
+        return sound_pages
+
+    def parse_duration(self, duration_str):
+        """Преобразует строку длительности в секунды"""
+        if not duration_str:
             return 0
-        clean_text = duration_text.strip().replace(" ", "")
-        # Обрабатываем формат "минуты:секунды"
-        if ":" in clean_text:
-            parts = clean_text.split(":")
+
+        duration_str = duration_str.strip()
+
+        # Убираем лишние пробелы и символы
+        duration_str = re.sub(r"\s+", "", duration_str)
+
+        # Формат "0:01" или "1:23"
+        if ":" in duration_str:
+            parts = duration_str.split(":")
             if len(parts) == 2:
                 try:
-                    return int(parts[0]) * 60 + int(parts[1])
+                    minutes = int(parts[0])
+                    seconds = int(parts[1])
+                    return minutes * 60 + seconds
                 except ValueError:
                     return 0
-        # Пытаемся извлечь числа из текста
-        numeric_parts = re.findall(r"\d+", clean_text)
-        if len(numeric_parts) == 1:
-            return int(numeric_parts[0])
-        elif len(numeric_parts) == 2:
-            return int(numeric_parts[0]) * 60 + int(numeric_parts[1])
+
+        # Пытаемся найти числа в строке
+        numbers = re.findall(r"\d+", duration_str)
+        if numbers:
+            # Если только одно число, считаем это секундами
+            if len(numbers) == 1:
+                return int(numbers[0])
+            # Если два числа, считаем это минутами:секундами
+            elif len(numbers) == 2:
+                return int(numbers[0]) * 60 + int(numbers[1])
+
         return 0
 
-    def get_audio_metadata(self, page_url):
-        """Получает длительность и прямую ссылку на аудиофайл со страницы."""
+    def get_duration_and_audio_url(self, page_url):
+        """Извлекает длительность и аудио URL со страницы звука"""
         try:
-            page_response = self.http_client.get(page_url, timeout=10)
-            page_soup = BeautifulSoup(page_response.text, "html.parser")
+            response = self.session.get(page_url, timeout=10)
+            soup = BeautifulSoup(response.text, "html.parser")
 
-            # Поиск элемента с длительностью
-            duration_element = page_soup.find("div", class_="item-grid-sfx-preview__meta-time")
-            if not duration_element:
-                duration_element = page_soup.find("div", {"data-test-id": "duration"})
+            # Ищем длительность по классу
+            duration_elem = soup.find("div", class_="item-grid-sfx-preview__meta-time")
+            if not duration_elem:
+                # Альтернативный поиск по data-test-id
+                duration_elem = soup.find("div", {"data-test-id": "duration"})
 
-            duration_seconds = 0
-            if duration_element:
-                raw_duration = duration_element.get_text(strip=True)
-                duration_seconds = self.extract_duration_seconds(raw_duration)
-                print(f"Длительность найдена: {raw_duration} -> {duration_seconds} сек")
+            duration_sec = 0
+            if duration_elem:
+                duration_text = duration_elem.get_text(strip=True)
+                duration_sec = self.parse_duration(duration_text)
+                print(f"Найдена длительность: {duration_text} -> {duration_sec} сек")
 
-            # Поиск элемента с ссылкой на аудио
-            audio_data_div = page_soup.find("div", {"data-audio-player-preview-url-value": True})
-            direct_audio_url = audio_data_div.get("data-audio-player-preview-url-value") if audio_data_div else None
+            # Аудио URL из data-атрибута
+            audio_div = soup.find("div", {"data-audio-player-preview-url-value": True})
+            audio_url = None
+            if audio_div:
+                audio_url = audio_div.get("data-audio-player-preview-url-value")
 
-            return duration_seconds, direct_audio_url
+            return duration_sec, audio_url
 
-        except Exception as err:
-            print(f"Ошибка получения данных со страницы {page_url}: {err}")
+        except Exception as e:
+            print(f"Ошибка извлечения данных со страницы {page_url}: {e}")
             return 0, None
 
-    def fetch_audio_file(self, page_url, output_dir, duration_threshold=10):
-        """Загружает аудиофайл, если его длительность превышает порог."""
-        track_duration, audio_source_url = self.get_audio_metadata(page_url)
-        if track_duration <= duration_threshold:
-            print(f"Пропускаю (малая длительность {track_duration}с): {page_url}")
-            return None, None
-        if not audio_source_url:
-            print(f"Не найдена ссылка на аудио: {page_url}")
-            return None, None
-        if not audio_source_url.startswith("http"):
-            print(f"Ссылка имеет неверный формат: {audio_source_url}")
+    def download_sound_from_page(self, page_url, download_folder, min_duration=10):
+        """Скачивает звук, только если его длительность > min_duration"""
+        duration_sec, audio_url = self.get_duration_and_audio_url(page_url)
+
+        if duration_sec <= min_duration:
+            print(f"Пропущен (слишком короткий: {duration_sec} сек): {page_url}")
             return None, None
 
-        # Формирование имени и пути для файла
-        base_name = os.path.basename(audio_source_url)
-        if not base_name.endswith(".mp3"):
-            base_name += ".mp3"
-        final_path = os.path.join(output_dir, base_name)
+        if not audio_url:
+            print(f"Не найден аудио URL: {page_url}")
+            return None, None
 
-        print(f"Загрузка ({track_duration} сек): {base_name}")
+        if not audio_url.startswith("http"):
+            print(f"Некорректный аудио URL: {audio_url}")
+            return None, None
+
+        # Формируем имя файла
+        filename = os.path.basename(audio_url)
+        if not filename.endswith(".mp3"):
+            filename += ".mp3"
+        filepath = os.path.join(download_folder, filename)
+
+        # Скачиваем файл
+        print(f"Скачивание ({duration_sec} сек): {filename}")
         try:
-            audio_response = self.http_client.get(audio_source_url, timeout=30)
+            audio_response = self.session.get(audio_url, timeout=120)
             if audio_response.status_code == 200:
-                with open(final_path, "wb") as audio_file:
-                    audio_file.write(audio_response.content)
-                # Проверка успешности сохранения
-                if os.path.exists(final_path) and os.path.getsize(final_path) > 0:
-                    return final_path, base_name
+                with open(filepath, "wb") as f:
+                    f.write(audio_response.content)
+
+                # Проверяем что файл скачался
+                if os.path.exists(filepath) and os.path.getsize(filepath) > 0:
+                    return filepath, filename
                 else:
-                    print(f"Файл не был сохранён или пуст: {base_name}")
+                    print(f"Файл не скачался или пустой: {filename}")
                     return None, None
             else:
-                print(f"Ошибка HTTP {audio_response.status_code} для {audio_source_url}")
-        except Exception as err:
-            print(f"Ошибка загрузки {base_name}: {err}")
+                print(
+                    f"Ошибка HTTP {audio_response.status_code} при скачивании: {audio_url}"
+                )
+        except Exception as e:
+            print(f"Ошибка скачивания {filename}: {e}")
 
         return None, None
 
-    def execute_download(self, output_dir, min_files=50, max_files=1000, min_duration=10):
-        """Основной метод, управляющий процессом загрузки."""
-        os.makedirs(output_dir, exist_ok=True)
-        meta_file_path = os.path.join(output_dir, "audio_metadata.csv")
+    def download_sounds(
+        self, download_folder, min_files=50, max_files=1000, min_duration=10
+    ):
+        """Основной метод скачивания звуков"""
+        os.makedirs(download_folder, exist_ok=True)
+        annotation_file = os.path.join(download_folder, "annotation.csv")
 
-        print("Поиск страниц с аудио...")
-        page_list = self.discover_audio_pages()
-        print(f"Найдено страниц для обработки: {len(page_list)}")
+        print("Поиск страниц со звуками...")
+        sound_pages = self.get_sound_pages()
+        print(f"Найдено потенциальных звуков: {len(sound_pages)}")
 
-        with open(meta_file_path, "w", newline="", encoding="utf-8") as meta_file:
-            csv_writer = csv.writer(meta_file)
-            csv_writer.writerow(["absolute_path", "relative_path", "filename", "duration_seconds"])
+        with open(annotation_file, "w", newline="", encoding="utf-8") as csvfile:
+            writer = csv.writer(csvfile)
+            writer.writerow(
+                ["absolute_path", "relative_path", "filename", "duration_seconds"]
+            )
 
-            success_count = 0
-            for idx, current_page in enumerate(page_list):
-                if success_count >= max_files:
+            downloaded = 0
+            for i, page_url in enumerate(sound_pages):
+                if downloaded >= max_files:
                     break
 
-                print(f"\n--- Страница {idx + 1}/{len(page_list)} ---")
-                saved_path, saved_name = self.fetch_audio_file(current_page, output_dir, min_duration)
+                print(f"\n--- Обработка {i + 1}/{len(sound_pages)} ---")
+                filepath, filename = self.download_sound_from_page(
+                    page_url, download_folder, min_duration
+                )
 
-                if saved_path and os.path.exists(saved_path):
-                    abs_path = os.path.abspath(saved_path)
-                    rel_path = os.path.relpath(saved_path, output_dir)
-                    # Получаем длительность повторно для записи
-                    actual_duration, _ = self.get_audio_metadata(current_page)
-                    csv_writer.writerow([abs_path, rel_path, saved_name, actual_duration])
-                    success_count += 1
-                    print(f"Успешно: {saved_name} ({actual_duration} сек) [{success_count}/{max_files}]")
+                if filepath and os.path.exists(filepath):
+                    absolute_path = os.path.abspath(filepath)
+                    relative_path = os.path.relpath(filepath, download_folder)
+
+                    # Получаем длительность для записи в CSV
+                    duration_sec, _ = self.get_duration_and_audio_url(page_url)
+
+                    writer.writerow(
+                        [absolute_path, relative_path, filename, duration_sec]
+                    )
+                    downloaded += 1
+                    print(
+                        f"Сохранён: {filename} ({duration_sec} сек) [{downloaded}/{max_files}]"
+                    )
                 else:
-                    print("Файл не был загружен.")
+                    print("Пропущен или ошибка загрузки")
 
+                # Задержка между запросами
                 time.sleep(random.uniform(1, 2))
 
-        print(f"\nГотово! Загружено файлов: {success_count}")
-        if success_count < min_files:
-            print(f"Внимание: загружено меньше требуемого минимума ({min_files})")
+        print(f"\n Завершено! Скачано файлов: {downloaded}")
+        if downloaded < min_files:
+            print(f" Внимание: скачано меньше минимального количества ({min_files})")
 
-        return meta_file_path
+        return annotation_file
 
 
-class AudioCollection:
-    """Итератор для работы с коллекцией аудиофайлов."""
+class SoundIterator:
+    def __init__(self, annotation_source):
+        """Итератор по аудиофайлам. Принимает путь к CSV или папке."""
+        self.file_paths = []
 
-    def __init__(self, source):
-        """Инициализация итератора. Источником может быть CSV-файл или директория."""
-        self.item_list = []
-        if os.path.isfile(source):
-            # Загрузка путей из CSV
-            with open(source, "r", encoding="utf-8") as f:
-                csv_reader = csv.reader(f)
-                next(csv_reader, None)
-                for row in csv_reader:
+        if os.path.isfile(annotation_source):
+            # Загрузка из CSV
+            with open(annotation_source, "r", encoding="utf-8") as f:
+                reader = csv.reader(f)
+                next(reader, None)  # пропуск заголовка
+                for row in reader:
                     if row and len(row) > 0:
-                        potential_path = row[0]
-                        if os.path.exists(potential_path):
-                            self.item_list.append(potential_path)
-            print(f"Загружено {len(self.item_list)} записей из файла метаданных")
-        elif os.path.isdir(source):
-            # Сканирование директории
-            for root_dir, _, files in os.walk(source):
-                for file_name in files:
-                    if file_name.lower().endswith((".mp3", ".wav", ".ogg")):
-                        self.item_list.append(os.path.join(root_dir, file_name))
-            print(f"Найдено {len(self.item_list)} файлов в директории")
+                        abs_path = row[0]
+                        if os.path.exists(abs_path):
+                            self.file_paths.append(abs_path)
+            print(f"Загружено {len(self.file_paths)} путей из аннотации")
+        elif os.path.isdir(annotation_source):
+            # Загрузка из папки
+            for root, _, files in os.walk(annotation_source):
+                for file in files:
+                    if file.lower().endswith((".mp3", ".wav", ".ogg")):
+                        self.file_paths.append(os.path.join(root, file))
+            print(f"Загружено {len(self.file_paths)} файлов из папки")
         else:
-            raise ValueError(f"Указанный источник не существует: {source}")
-
-        self.current_position = 0
+            raise ValueError(
+                f"Укажите существующий CSV-файл или папку: {annotation_source}"
+            )
 
     def __iter__(self):
-        self.current_position = 0
+        self._index = 0
         return self
 
     def __next__(self):
-        if self.current_position < len(self.item_list):
-            next_item = self.item_list[self.current_position]
-            self.current_position += 1
-            return next_item
-        raise StopIteration
+        if self._index < len(self.file_paths):
+            path = self.file_paths[self._index]
+            self._index += 1
+            return path
+        else:
+            raise StopIteration
 
     def __len__(self):
-        return len(self.item_list)
+        return len(self.file_paths)
 
 
-def run_program():
-    """Точка входа в программу."""
-    cli_args = handle_cli_args()
+def main():
+    """Основная функция программы"""
+    # Парсим аргументы командной строки
+    args = parse_arguments()
 
-    audio_fetcher = AudioHarvester()
-    metadata_path = audio_fetcher.execute_download(
-        output_dir=cli_args.target_dir,
-        min_files=cli_args.min_count,
-        max_files=cli_args.max_count,
+    # Скачивание звуков
+    downloader = SoundDownloader()
+    annotation_path = downloader.download_sounds(
+        download_folder=args.download_folder,
+        min_files=args.min_files,
+        max_files=args.max_files,
         min_duration=10,
     )
 
-    # Демонстрация работы итератора
-    if metadata_path and os.path.exists(metadata_path):
+    # Демонстрация итератора
+    if annotation_path and os.path.exists(annotation_path):
         print("\n" + "=" * 50)
-        print("Работа итератора по коллекции:")
+        print("Демонстрация работы итератора:")
         print("=" * 50)
 
-        collection_iter = AudioCollection(metadata_path)
-        print(f"Всего элементов для перебора: {len(collection_iter)}")
+        iterator = SoundIterator(annotation_path)
+        print(f"Всего файлов для итерации: {len(iterator)}")
 
-        print("\nПервые 5 элементов коллекции:")
-        for i, elem_path in enumerate(collection_iter):
+        print("\nПервые 5 файлов:")
+        for i, path in enumerate(iterator):
             if i < 5:
-                print(f"{i + 1}: {os.path.basename(elem_path)}")
+                print(f"{i + 1}: {os.path.basename(path)}")
+
         print("...")
 
 
 if __name__ == "__main__":
-    run_program()
+    main()
